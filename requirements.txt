@@ -1,0 +1,22 @@
+# Core runtime is pure-Python stdlib; the package runs offline with no extras.
+# These are only needed for the eval harness and the optional online/LangGraph modes.
+
+# --- evaluation harness (required to run eval/harness.py) ---
+pyyaml>=6.0
+pytest>=7.0
+
+# --- optional: real LangGraph orchestration (a deterministic fallback is used if absent) ---
+# langgraph>=0.2.0
+# langchain-core>=0.3.0
+
+# --- optional: CrewAI roles (the package ships role classes; install to use the real framework) ---
+# crewai>=0.51.0
+
+# --- optional: real model providers (set LSRA_PROVIDER=openai|anthropic) ---
+# openai>=1.40.0
+# anthropic>=0.34.0
+
+# --- optional: production vector store / embeddings ---
+# qdrant-client>=1.10.0
+# psycopg[binary]>=3.2.0      # pgvector
+# sentence-transformers>=3.0.0

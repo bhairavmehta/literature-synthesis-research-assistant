@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lsra"
+version = "1.0.0"
+description = "Literature Synthesis Research Assistant - auditable six-agent ML/AI research synthesis"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Bhairav Mehta"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+eval = ["pyyaml>=6.0", "pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

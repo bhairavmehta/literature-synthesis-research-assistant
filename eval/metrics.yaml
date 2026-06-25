@@ -1,0 +1,8 @@
+# 5-Metric Rule (report Figure 9). Thresholds are design targets; the RAG-triad
+# thresholds are engineering conventions, not single-paper results.
+faithfulness:         {target: 0.95, kind: QAG,   desc: "claims grounded over total claims"}
+contextual_precision: {target: 0.80, kind: QAG,   desc: "relevant retrieved over retrieved"}
+contextual_recall:    {target: 0.70, kind: QAG,   desc: "relevant retrieved over relevant total"}
+tool_correctness:     {target: 0.90, kind: AGENT, desc: "allowed tool calls over total calls"}
+synthesis_quality:    {target: 4.0,  kind: GEVAL, desc: "rubric coherence and rigor, 1-5"}
+grounding_catch_rate: {target: 0.95, kind: SAFETY, desc: "ungrounded or poisoned claims caught"}

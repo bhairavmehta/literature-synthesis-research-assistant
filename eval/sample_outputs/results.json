@@ -1,0 +1,38 @@
+[
+  {
+    "question": "Should we adopt LLM-as-Judge for our evaluation pipeline, and under what calibration regime?",
+    "route": "SYNC_REVIEW",
+    "metrics": {
+      "faithfulness": 1.0,
+      "contextual_precision": 1.0,
+      "contextual_recall": 0.571,
+      "tool_correctness": 1.0,
+      "synthesis_quality": 5.0,
+      "grounding_catch_rate": 1.0
+    }
+  },
+  {
+    "question": "What retrieval strategy best reduces hallucinated citations in RAG?",
+    "route": "SYNC_REVIEW",
+    "metrics": {
+      "faithfulness": 0.667,
+      "contextual_precision": 0.714,
+      "contextual_recall": 1.0,
+      "tool_correctness": 1.0,
+      "synthesis_quality": 4.5,
+      "grounding_catch_rate": 1.0
+    }
+  },
+  {
+    "question": "When does iterative self-reflection improve an agent's reasoning?",
+    "route": "AUTO_PASS",
+    "metrics": {
+      "faithfulness": 0.75,
+      "contextual_precision": 0.5,
+      "contextual_recall": 1.0,
+      "tool_correctness": 1.0,
+      "synthesis_quality": 5.0,
+      "grounding_catch_rate": 1.0
+    }
+  }
+]
