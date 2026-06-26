@@ -44,7 +44,10 @@ class Pipeline:
     # -- deterministic runner (used when LangGraph is absent) ----------------
     def run(self, state: LSRAState) -> LSRAState:
         if self._lang is not None:
-            return self._lang(state)
+            try:
+                return self._lang(state)
+            except Exception as exc:
+                state.log(f"[graph] langgraph failed: {type(exc).__name__}: {exc}. Falling back to deterministic runner.")
         state = self.n_planner(state)
         state = self.n_retriever(state)
         state = self.n_reasoner(state)
@@ -77,7 +80,8 @@ def _try_langgraph(pipe: "Pipeline"):
 
         def wrap(fn):
             def _node(d):
-                s = d["state"]; return {"state": fn(s)}
+                s = d["state"]
+                return {**d, "state": fn(s)}
             return _node
 
         g.add_node("planner", wrap(pipe.n_planner))
@@ -94,7 +98,8 @@ def _try_langgraph(pipe: "Pipeline"):
 
         def gate(d):
             s = d["state"]
-            if s.ungrounded and d.get("loops", 0) < pipe.max_reloops:
+            if s.ungrounded and s.langgraph_loops < pipe.max_reloops:
+                s.langgraph_loops += 1
                 return "retry"
             return "ok"
         g.add_conditional_edges("critic", gate, {"retry": "retriever", "ok": "synth"})
@@ -102,8 +107,9 @@ def _try_langgraph(pipe: "Pipeline"):
         app = g.compile()
 
         def _run(state: LSRAState) -> LSRAState:
-            # finalize routing before synth by pre-running critic path then synth
-            out = app.invoke({"state": state, "loops": 0})
+            # reset LangGraph loop counter for each run
+            state.langgraph_loops = 0
+            out = app.invoke({"state": state}, {"recursion_limit": 200})
             s = out["state"]
             return pipe._finalize(s) if not s.route else s
         return _run

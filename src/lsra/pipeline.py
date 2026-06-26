@@ -8,13 +8,18 @@ from .llm import get_llm
 
 
 def answer(question: str, impact: str = "medium",
-           corpus_path: Optional[str] = None) -> LSRAState:
+           corpus_path: Optional[str] = None,
+           state: Optional[LSRAState] = None) -> LSRAState:
     papers = load_corpus(corpus_path)
     papers_by_id = {p.paper_id: p for p in papers}
     store = VectorStore()
     store.add(papers)
     llm = get_llm()
     pipe = build_pipeline(store, papers_by_id, llm=llm)
-    state = LSRAState(question=question, impact=impact)
+    if state is None:
+        state = LSRAState(question=question, impact=impact)
+    else:
+        state.question = question
+        state.impact = impact
     state.log(f"[pipeline] corpus={len(papers)} papers; provider live")
     return pipe.run(state)

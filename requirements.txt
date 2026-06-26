@@ -13,8 +13,8 @@ pytest>=7.0
 # crewai>=0.51.0
 
 # --- optional: real model providers (set LSRA_PROVIDER=openai|anthropic) ---
-# openai>=1.40.0
-# anthropic>=0.34.0
+openai>=1.40.0
+anthropic>=0.34.0
 
 # --- optional: production vector store / embeddings ---
 # qdrant-client>=1.10.0

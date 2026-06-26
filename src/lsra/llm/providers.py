@@ -26,14 +26,37 @@ class OpenAILLM:
 class AnthropicLLM:
     def __init__(self, model: str = None):
         import anthropic  # requires `pip install anthropic` + ANTHROPIC_API_KEY
-        self.client = anthropic.Anthropic()
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model or os.environ.get("LSRA_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
     def complete(self, system: str, prompt: str, temperature: float = 0.1) -> str:
         r = self.client.messages.create(
-            model=self.model, max_tokens=1024, temperature=temperature,
-            system=system, messages=[{"role": "user", "content": prompt}])
-        return "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
+            model=self.model,
+            system=system,
+            messages=[
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_tokens=1024,
+            timeout=60,
+        )
+        def stringify(value):
+            if isinstance(value, str):
+                return value
+            if isinstance(value, list):
+                return "".join(stringify(item) for item in value)
+            if hasattr(value, "content"):
+                return stringify(value.content)
+            if hasattr(value, "text"):
+                return stringify(value.text)
+            return str(value)
+
+        if hasattr(r, "content"):
+            return stringify(r.content)
+        if hasattr(r, "message") and hasattr(r.message, "content"):
+            return stringify(r.message.content)
+        return stringify(r)
 
 
 class ProviderEmbedder:

@@ -18,13 +18,28 @@ import json
 import os
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from lsra import answer  # noqa: E402
+from lsra.state import LSRAState  # noqa: E402
 
 CORPUS_PATH = os.path.join(os.path.dirname(__file__), "data", "corpus", "papers.json")
+
+PROVIDER = os.environ.get("LSRA_PROVIDER", "stub").strip().lower()
+ONLINE_RETRIEVAL = os.environ.get("LSRA_ONLINE_RETRIEVAL", "0") == "1"
+
+if PROVIDER == "anthropic":
+    RUNTIME_STATUS = "online · Anthropic provider"
+    FOOTER_LABEL = "Online mode enabled — powered by Anthropic."
+elif PROVIDER == "openai":
+    RUNTIME_STATUS = "online · OpenAI provider"
+    FOOTER_LABEL = "Online mode enabled — powered by OpenAI."
+else:
+    RUNTIME_STATUS = "offline · deterministic stub provider"
+    FOOTER_LABEL = "Offline demo · no API keys · stdlib-only server."
 
 SAMPLE_QUESTIONS = [
     {
@@ -105,6 +120,16 @@ def corpus_payload() -> list:
     ]
 
 
+JOB_STATE = {
+    "status": "idle",
+    "question": "",
+    "impact": "medium",
+    "trace": [],
+    "last_updated": 0.0,
+    "error": None,
+}
+JOB_LOCK = threading.Lock()
+
 def state_to_dict(state) -> dict:
     """Serialise the LSRAState into the JSON the frontend renders."""
     return {
@@ -151,13 +176,39 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter console
         sys.stderr.write("  [http] " + (fmt % args) + "\n")
 
-    def _send(self, code, body, content_type="application/json"):
+    def _send(self, code, body, content_type="application/json", head_only=False):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if not head_only:
+            self.wfile.write(data)
+
+    def do_HEAD(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, INDEX_HTML, "text/html", head_only=True)
+        elif self.path == "/api/samples":
+            self._send(200, json.dumps(SAMPLE_QUESTIONS), head_only=True)
+        elif self.path == "/api/agents":
+            self._send(200, json.dumps(AGENTS), head_only=True)
+        elif self.path == "/api/corpus":
+            self._send(200, json.dumps(corpus_payload()), head_only=True)
+        elif self.path == "/api/status":
+            with JOB_LOCK:
+                payload = {
+                    "status": JOB_STATE["status"],
+                    "question": JOB_STATE["question"],
+                    "impact": JOB_STATE["impact"],
+                    "trace": list(JOB_STATE["trace"]),
+                    "last_updated": JOB_STATE["last_updated"],
+                    "error": JOB_STATE["error"],
+                }
+            self._send(200, json.dumps(payload), head_only=True)
+        elif self.path == "/health":
+            self._send(200, json.dumps({"ok": True}), head_only=True)
+        else:
+            self._send(404, json.dumps({"error": "not found"}), head_only=True)
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -168,6 +219,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(AGENTS))
         elif self.path == "/api/corpus":
             self._send(200, json.dumps(corpus_payload()))
+        elif self.path == "/api/status":
+            with JOB_LOCK:
+                payload = {
+                    "status": JOB_STATE["status"],
+                    "question": JOB_STATE["question"],
+                    "impact": JOB_STATE["impact"],
+                    "trace": list(JOB_STATE["trace"]),
+                    "last_updated": JOB_STATE["last_updated"],
+                    "error": JOB_STATE["error"],
+                }
+            self._send(200, json.dumps(payload))
         elif self.path == "/health":
             self._send(200, json.dumps({"ok": True}))
         else:
@@ -177,22 +239,51 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/api/answer":
             self._send(404, json.dumps({"error": "not found"}))
             return
+        start_ts = time.time()
+        question = None
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
             question = (payload.get("question") or "").strip()
             impact = payload.get("impact", "medium")
+            self.log_message("POST /api/answer start: question=%r impact=%s", question, impact)
             if not question:
                 self._send(400, json.dumps({"error": "question is required"}))
                 return
             if impact not in ("low", "medium", "high"):
                 impact = "medium"
-            state = answer(question, impact=impact, corpus_path=CORPUS_PATH)
+            state = LSRAState(question=question, impact=impact)
+            state.trace.append("[status] queued; starting pipeline")
+            with JOB_LOCK:
+                JOB_STATE.update({
+                    "status": "running",
+                    "question": question,
+                    "impact": impact,
+                    "trace": state.trace,
+                    "last_updated": time.time(),
+                    "error": None,
+                })
+            state = answer(question, impact=impact, corpus_path=CORPUS_PATH, state=state)
+            with JOB_LOCK:
+                JOB_STATE.update({
+                    "status": "done",
+                    "trace": list(state.trace),
+                    "last_updated": time.time(),
+                })
             self._send(200, json.dumps(state_to_dict(state)))
         except Exception as exc:  # surface errors to the UI instead of 500-ing silently
             import traceback
             traceback.print_exc()
+            with JOB_LOCK:
+                JOB_STATE.update({
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "last_updated": time.time(),
+                })
             self._send(500, json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+        finally:
+            elapsed = time.time() - start_ts
+            self.log_message("POST /api/answer end: question=%r elapsed=%.1fs", question, elapsed)
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -203,35 +294,38 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <title>LSRA — Literature Synthesis Research Assistant</title>
 <style>
   :root {
-    --bg:#0b0e14; --panel:#141823; --panel2:#1b2030; --panel3:#222842;
-    --border:#2a3142; --border2:#39425a;
-    --text:#e7ebf3; --muted:#94a0b4; --faint:#6b7689;
-    --accent:#5b9dff; --accent2:#9a7cff; --cyan:#3fd6c8;
-    --good:#3fb950; --warn:#e3a008; --bad:#f85149; --chip:#1e2433;
+    --bg:#faf9f7; --panel:#ffffff; --panel2:#f8f7f3; --panel3:#f1efe8;
+    --border:#e4e1db; --border2:#d9d5cf;
+    --text:#1f1f1f; --muted:#636363; --faint:#8f8f8f;
+    --accent:#a50021; --accent2:#d2292f; --cyan:#005c83;
+    --good:#0f7035; --warn:#b66d10; --bad:#a50021; --chip:#f3f1ec;
   }
   * { box-sizing:border-box; }
   html { scroll-behavior:smooth; }
-  body { margin:0; background:
-      radial-gradient(1200px 500px at 80% -10%, rgba(91,157,255,.10), transparent 60%),
-      radial-gradient(900px 500px at 0% 0%, rgba(154,124,255,.08), transparent 55%),
-      var(--bg);
-    color:var(--text); font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.7 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
   a { color:var(--accent); text-decoration:none; }
   a:hover { text-decoration:underline; }
   .wrap { max-width:1140px; margin:0 auto; padding:0 24px; }
 
-  header { border-bottom:1px solid var(--border); padding:30px 0 26px;
-    background:linear-gradient(180deg, rgba(20,24,35,.7), transparent); }
+  header { border-bottom:1px solid var(--border); padding:28px 0 22px; background:var(--panel); }
   .brand { display:flex; align-items:center; gap:14px; }
-  .logo { width:46px; height:46px; border-radius:12px; flex:none;
+  .logo { width:48px; height:48px; border-radius:14px; flex:none;
     background:linear-gradient(135deg,var(--accent),var(--accent2)); position:relative;
-    box-shadow:0 6px 24px rgba(91,157,255,.35); }
+    box-shadow:0 8px 30px rgba(165,0,33,.12); }
   .logo:before { content:"LS"; position:absolute; inset:0; display:grid; place-items:center;
     font-weight:800; font-size:17px; color:#07101f; letter-spacing:.5px; }
-  header h1 { margin:0; font-size:22px; letter-spacing:.2px; }
+  header h1 { margin:0; font-size:24px; letter-spacing:.24px; }
   header h1 b { color:var(--accent); }
-  header .sub { color:var(--muted); font-size:13.5px; margin-top:3px; }
-  .statline { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+  header .sub { color:var(--muted); font-size:13.5px; margin-top:5px; line-height:1.5; max-width:720px; }
+  .topnav { margin-top:18px; display:flex; flex-wrap:wrap; gap:10px; }
+  .topnav a { color:var(--accent); font-size:13px; font-weight:700; text-decoration:none; border:1px solid transparent; padding:8px 13px; border-radius:999px; background:rgba(165,0,33,.05); }
+  .topnav a:hover { background:rgba(165,0,33,.12); }
+  .quick-actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:20px; }
+  .mini { border:1px solid var(--border); background:var(--panel2); color:var(--text); border-radius:10px; padding:10px 14px; font:600 13px/1 inherit; cursor:pointer; transition:transform .15s, background .15s; }
+  .mini:hover { background:rgba(212,18,40,.08); transform:translateY(-1px); }
+  .mini:active { transform:translateY(0); }
+  .statline { display:flex; gap:8px; flex-wrap:wrap; margin-top:18px; }
   .stat { background:var(--chip); border:1px solid var(--border); border-radius:8px;
     padding:7px 12px; font-size:12px; color:var(--muted); }
   .stat b { color:var(--text); font-weight:600; }
@@ -239,8 +333,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     background:var(--good); margin-right:6px; vertical-align:0; box-shadow:0 0 8px var(--good); }
 
   main { padding:26px 0 70px; }
-  .card { background:var(--panel); border:1px solid var(--border); border-radius:14px;
-    padding:22px; margin-bottom:20px; box-shadow:0 1px 0 rgba(255,255,255,.02) inset; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:18px;
+    padding:24px; margin-bottom:22px; box-shadow:0 12px 32px rgba(30,32,34,.05); }
   .card > h2 { margin:0 0 4px; font-size:16px; }
   .card > .hint { color:var(--muted); font-size:13px; margin:0 0 16px; }
 
@@ -272,7 +366,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .samples-head span { font-size:12.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }
   .chips { display:flex; gap:9px; flex-wrap:wrap; }
   .chip { background:var(--chip); border:1px solid var(--border); color:var(--text);
-    border-radius:10px; padding:9px 12px; font-size:12.5px; cursor:pointer; max-width:340px;
+    border-radius:12px; padding:11px 14px; font-size:13px; cursor:pointer; max-width:360px;
     transition:border-color .12s, transform .12s; }
   .chip:hover { border-color:var(--accent); transform:translateY(-1px); }
   .chip .tagrow { display:flex; gap:7px; align-items:center; margin-bottom:4px; }
@@ -324,10 +418,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     letter-spacing:.5px; margin-left:6px; }
 
   #status { color:var(--muted); font-size:13.5px; margin-top:18px; min-height:20px; display:flex;
-    align-items:center; gap:9px; }
+    flex-direction:column; gap:10px; }
   .spinner { width:15px; height:15px; border:2px solid var(--border2); border-top-color:var(--accent);
     border-radius:50%; animation:spin .7s linear infinite; flex:none; }
   @keyframes spin { to { transform:rotate(360deg); } }
+  .current-step { color:var(--text); font-weight:700; }
+  .status-lines { display:flex; flex-direction:column; gap:4px; font-size:13px; color:var(--text); }
+  .status-error { color:var(--bad); font-weight:700; }
   .steps { display:flex; gap:6px; flex-wrap:wrap; }
   .steps .s { font-size:11px; color:var(--faint); padding:2px 8px; border-radius:6px; background:var(--chip); }
   .steps .s.done { color:var(--good); }
@@ -351,8 +448,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tab .ct { display:inline-block; background:var(--chip); border-radius:10px; padding:0 7px;
     font-size:11px; margin-left:6px; color:var(--muted); }
   .pane { display:none; } .pane.active { display:block; }
+  #section-tabs { margin-bottom:24px; }
+  #section-tabs .tab { border:1px solid var(--border); border-bottom-color:transparent; background:var(--panel2); border-radius:10px 10px 0 0; }
+  #section-tabs .tab.active { background:var(--panel); border-color:var(--border); border-bottom-color:var(--panel); }
 
-  .md h1 { font-size:23px; } .md h2 { font-size:18px; border-bottom:1px solid var(--border);
+  .architecture-board { display:grid; gap:18px; padding:8px 0; }
+  .arch-row { display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:center; }
+  .arch-node { min-width:180px; flex:1 1 220px; background:var(--panel2); border:1px solid var(--border); border-radius:14px; padding:18px 16px; box-shadow:0 10px 24px rgba(31,31,31,.06); }
+  .arch-node h3 { margin:0 0 8px; font-size:15px; color:var(--accent); }
+  .arch-node p { margin:0; color:var(--muted); font-size:13px; line-height:1.5; }
+  .arch-arrow { font-size:22px; color:var(--muted); }
+  .arch-columns { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; }
+  .arch-block { background:var(--panel2); border:1px solid var(--border); border-radius:14px; padding:18px; }
+  .arch-block h4 { margin:0 0 8px; font-size:14px; color:var(--accent); }
+  .arch-block ul { padding-left:18px; margin:0; color:var(--muted); }
+  .arch-block li { margin-bottom:10px; font-size:13px; line-height:1.6; }
     padding-bottom:6px; margin-top:28px; } .md h3 { font-size:15px; color:var(--accent); }
   .md ul { padding-left:22px; } .md li { margin:6px 0; }
   .md em { color:var(--muted); } .md hr { border:0; border-top:1px solid var(--border); margin:22px 0; }
@@ -399,8 +509,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     margin:18px 0 9px; }
   .empty { color:var(--faint); font-style:italic; padding:8px 0; }
 
-  footer { color:var(--faint); font-size:12.5px; text-align:center; padding:30px 24px;
-    border-top:1px solid var(--border); }
+  footer { color:var(--faint); font-size:13px; text-align:center; padding:32px 24px;
+    border-top:1px solid var(--border); background:var(--panel2); }
 </style>
 </head>
 <body>
@@ -414,16 +524,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="statline">
-    <div class="stat"><span class="dot"></span>offline · deterministic stub provider</div>
+    <div class="stat"><span class="dot"></span>{RUNTIME_STATUS}</div>
     <div class="stat"><b id="st-papers">19</b> papers in corpus</div>
     <div class="stat"><b>6</b> agents</div>
     <div class="stat">defense target: <b>confident hallucinated synthesis</b></div>
+  </div>
+  <div style="margin-top:16px; display:flex; flex-wrap:wrap; gap:16px; align-items:center;">
+    <div style="font-size:13px; color:var(--muted);">
+      <strong>Bhairav Mehta</strong> · Agentic AI Graduate Program Student
+    </div>
+    <div style="font-size:13px; color:var(--muted);">
+      Carnegie Mellon University
+    </div>
+  </div>
+  <div class="topnav">
+    <a href="#ask">Ask a question</a>
+    <a href="#section-how">Pipeline</a>
+    <a href="#section-corpus">Corpus</a>
+    <a href="#results">Results</a>
+    <a href="#architecture-section">Architecture</a>
+  </div>
+  <div style="margin-top:10px; color:var(--muted); font-size:13px;">
+    Status: app deployed and responding. When Anthropic online mode is enabled, answer generation may take longer due to external model inference and cold-start latency.
   </div>
 </div></header>
 
 <main><div class="wrap">
 
-  <div class="card">
+  <div class="card" id="ask">
     <h2>Ask a research question</h2>
     <p class="hint">A senior-level, open ML/AI question. The pipeline plans sub-questions, retrieves and
       grades evidence, resolves contradictions, gates on grounding + calibration, then composes a cited brief.</p>
@@ -446,22 +574,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <div class="samples-head"><span>Try an example</span><span id="sample-count"></span></div>
     <div class="chips" id="samples"></div>
+    <div class="quick-actions">
+      <button class="mini" id="show-pipeline">Show pipeline</button>
+      <button class="mini" id="show-corpus">Browse corpus</button>
+      <button class="mini" id="show-architecture">View architecture</button>
+      <button class="mini" id="focus-results">View latest results</button>
+    </div>
     <div id="status"></div>
   </div>
 
-  <details class="disclosure" id="how">
-    <summary>How it works — the six-agent pipeline <small>each agent closes one failure mode</small>
-      <span class="chev">▸</span></summary>
-    <div class="disclosure-body">
+  <div class="card" id="explainer-tabs">
+    <div class="tabs" id="section-tabs">
+      <div class="tab active" data-tab="how">How it works</div>
+      <div class="tab" data-tab="corpus">Corpus browser</div>
+    </div>
+    <div class="pane active" id="section-how">
       <div class="pipeline" id="pipeline"></div>
       <div class="agents" id="agents"></div>
     </div>
-  </details>
-
-  <details class="disclosure" id="corpusD">
-    <summary>Corpus browser <small><span id="corpus-count">19</span> papers — 16 real (paraphrased) + 3 synthetic</small>
-      <span class="chev">▸</span></summary>
-    <div class="disclosure-body">
+    <div class="pane" id="section-corpus">
       <div class="corpus-controls">
         <input id="corpus-search" placeholder="Filter by title, author, abstract…">
         <label style="display:flex;align-items:center;gap:7px;text-transform:none;letter-spacing:0;color:var(--muted);margin:0">
@@ -469,8 +600,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="papers" id="papers"></div>
     </div>
-  </details>
+  </div>
 
+  <div id="architecture-section"></div>
   <div id="results" class="card">
     <div class="badges" id="badges"></div>
     <div class="tabs" id="tabs"></div>
@@ -479,13 +611,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="pane" id="pane-evidence"></div>
     <div class="pane" id="pane-contra"></div>
     <div class="pane" id="pane-safety"></div>
+    <div class="pane" id="pane-architecture"></div>
     <div class="pane" id="pane-log"></div>
   </div>
 
 </div></main>
 
 <footer>Built for the CMU Agentic AI Executive Education capstone — Bhairav Mehta.
-  Offline demo · no API keys · stdlib-only server.</footer>
+  {FOOTER_LABEL}</footer>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -592,7 +725,7 @@ function setTabs(counts) {
   const defs = [
     ['brief','Brief',null], ['claims','Claims',counts.claims],
     ['evidence','Evidence',counts.evidence], ['contra','Contradictions',counts.contra],
-    ['safety','Safety & Routing',counts.safety], ['log','Audit log',counts.log],
+    ['safety','Safety & Routing',counts.safety], ['architecture','Architecture',null], ['log','Audit log',counts.log],
   ];
   const tabs = $('#tabs'); tabs.innerHTML = '';
   defs.forEach(([id,label,ct],i) => {
@@ -678,18 +811,166 @@ function render(d) {
   $('#results').scrollIntoView({ behavior:'smooth', block:'start' });
 }
 
+function renderArchitecture() {
+  $('#pane-architecture').innerHTML = `
+    <div class="md">
+      <h1>Architecture & Implementation</h1>
+      <p>This app is a six-agent literature synthesis pipeline built for auditable AI research summarization.</p>
+      <div class="architecture-board">
+        <div class="arch-row">
+          <div class="arch-node"><h3>Planner</h3><p>Decomposes the main research query into focused sub-questions for evidence-driven reasoning.</p></div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-node"><h3>Retriever</h3><p>Generates HyDE prompts, recalls candidate evidence, reranks results, and applies the CRAG gate.</p></div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-node"><h3>Reasoner</h3><p>Forms claims from retrieved evidence and assesses support quality before downstream synthesis.</p></div>
+        </div>
+        <div class="arch-row">
+          <div class="arch-node"><h3>Contradiction Resolver</h3><p>Detects conflicting claims and resolves or labels open contradictions explicitly.</p></div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-node"><h3>Critic</h3><p>Applies grounding and Platt/conformal calibration thresholds to filter out unsupported claims.</p></div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-node"><h3>Synthesizer</h3><p>Composes the final cited brief using only admitted claims and grounded evidence.</p></div>
+        </div>
+      </div>
+      <div class="arch-columns">
+        <div class="arch-block">
+          <h4>Frontend</h4>
+          <ul>
+            <li><strong>app.py</strong> serves the UI using Python standard library HTTP server.</li>
+            <li>Everything is embedded inline: HTML, CSS, and JS.</li>
+            <li>UI includes interactive tabs, sample scenarios, and corpus browser.</li>
+          </ul>
+        </div>
+        <div class="arch-block">
+          <h4>Core pipeline</h4>
+          <ul>
+            <li><strong>src/lsra/pipeline.py</strong>: main entrypoint.</li>
+            <li><strong>src/lsra/agents/</strong>: six agent modules.</li>
+            <li><strong>src/lsra/llm/</strong>: stub and provider adapters.</li>
+          </ul>
+        </div>
+        <div class="arch-block">
+          <h4>Data & mode</h4>
+          <ul>
+            <li><strong>data/corpus/papers.json</strong> stores the offline corpus.</li>
+            <li><strong>LSRA_PROVIDER=anthropic</strong> enables online model mode.</li>
+            <li><strong>LSRA_ONLINE_RETRIEVAL=1</strong> enables live retrieval.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="arch-legend">
+        <div class="legend-item"><div class="dot process"></div><div class="legend-text"><strong>Process</strong>: flow from planner to synthesizer.</div></div>
+        <div class="legend-item"><div class="dot data"></div><div class="legend-text"><strong>Data</strong>: corpus, retrieval, evidence, claims.</div></div>
+        <div class="legend-item"><div class="dot deploy"></div><div class="legend-text"><strong>Deployment</strong>: app service, config, and online model settings.</div></div>
+      </div>
+      <h2>Deployment status</h2>
+      <p>The app is currently deployed and responding on the page. If model execution is delayed, it is usually because Anthropic requests are in progress or the app is warming up after a cold start.</p>
+    </div>
+  `;
+}
+
 const STEPS = ['planner','retriever','reasoner','resolver','critic','synthesizer'];
+const STEP_LABELS = {
+  planner: 'Planner',
+  retriever: 'Retriever',
+  reasoner: 'Reasoner',
+  resolver: 'Contradiction Resolver',
+  critic: 'Critic',
+  synthesizer: 'Synthesizer',
+};
+
 function showProgress() {
   const html = '<div class="spinner"></div><div><div>Running the six-agent pipeline…</div>' +
+    '<div class="current-step" id="current-step">Current step: starting…</div>' +
+    '<div class="status-lines" id="status-lines"><div>Waiting for model execution...</div></div>' +
     '<div class="steps" id="steps">' + STEPS.map(s=>`<span class="s" data-s="${s}">${s}</span>`).join('') + '</div></div>';
   $('#status').innerHTML = html;
   let i = 0;
-  return setInterval(() => {
+  const interval = setInterval(() => {
     const nodes = document.querySelectorAll('#steps .s');
     if (!nodes.length) return;
     nodes.forEach((n,k)=>{ n.classList.toggle('done',k<i); n.classList.toggle('active',k===i); });
     i = (i+1) % (STEPS.length+1);
   }, 280);
+  return interval;
+}
+
+function currentStepFromTrace(trace) {
+  if (!trace || !trace.length) return null;
+  const last = trace.slice(-1)[0] || '';
+  const lookup = {
+    '[status]': 'planner',
+    '[pipeline]': 'planner',
+    '[planner]': 'planner',
+    '[retriever]': 'retriever',
+    '[reasoner]': 'reasoner',
+    '[resolver]': 'resolver',
+    '[critic]': 'critic',
+    '[synthesizer]': 'synthesizer',
+    '[graph] grounding failure': 'retriever',
+    '[graph]': 'critic',
+  };
+  for (const key of Object.keys(lookup)) {
+    if (last.includes(key)) return lookup[key];
+  }
+  if (/planner/i.test(last)) return 'planner';
+  if (/retriev/i.test(last)) return 'retriever';
+  if (/reasoner/i.test(last)) return 'reasoner';
+  if (/resolver/i.test(last)) return 'resolver';
+  if (/critic/i.test(last)) return 'critic';
+  if (/synth/i.test(last)) return 'synthesizer';
+  return null;
+}
+
+function highlightStep(step) {
+  const nodes = document.querySelectorAll('#steps .s');
+  if (!nodes.length) return;
+  nodes.forEach(n => {
+    const key = n.dataset.s;
+    n.classList.toggle('active', key === step);
+    n.classList.toggle('done', STEP_LABELS[key] && step && Object.keys(STEP_LABELS).indexOf(key) < Object.keys(STEP_LABELS).indexOf(step));
+  });
+}
+
+function renderCurrentStep(trace) {
+  const target = $('#current-step');
+  if (!target) return;
+  const step = currentStepFromTrace(trace);
+  if (step) {
+    target.textContent = `Current step: ${STEP_LABELS[step] || step}`;
+    highlightStep(step);
+  } else {
+    target.textContent = 'Current step: waiting for pipeline start…';
+  }
+}
+
+function renderStatusLines(status) {
+  const target = $('#status-lines');
+  if (!target) return;
+  if (status.error) {
+    target.innerHTML = `<div class="status-error">${escapeHtml(status.error)}</div>`;
+    renderCurrentStep(status.trace || []);
+    return;
+  }
+  renderCurrentStep(status.trace || []);
+  const rows = status.trace.slice(-6).map(line => `<div>${escapeHtml(line)}</div>`);
+  if (!rows.length) {
+    target.innerHTML = '<div>Starting pipeline…</div>';
+  } else {
+    target.innerHTML = rows.join('');
+  }
+}
+
+async function pollStatus() {
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) return;
+    const status = await resp.json();
+    renderStatusLines(status);
+    return status.status;
+  } catch (err) {
+    return null;
+  }
 }
 
 async function run() {
@@ -697,6 +978,12 @@ async function run() {
   if (!question) { $('#status').innerHTML = '<span style="color:var(--warn)">Enter a question first.</span>'; return; }
   $('#run').disabled = true;
   const timer = showProgress();
+  const poller = setInterval(async () => {
+    const status = await pollStatus();
+    if (status === 'done' || status === 'error') {
+      clearInterval(poller);
+    }
+  }, 900);
   try {
     const r = await fetch('/api/answer', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -704,10 +991,13 @@ async function run() {
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || ('HTTP '+r.status));
-    clearInterval(timer); $('#status').innerHTML = '';
+    clearInterval(timer);
+    clearInterval(poller);
+    $('#status').innerHTML = '';
     render(d);
   } catch (e) {
     clearInterval(timer);
+    clearInterval(poller);
     $('#status').innerHTML = '<span style="color:var(--bad)">Error: ' + escapeHtml(e.message) + '</span>';
   } finally {
     $('#run').disabled = false;
@@ -715,11 +1005,42 @@ async function run() {
 }
 $('#run').onclick = run;
 $('#q').addEventListener('keydown', e => { if (e.key==='Enter' && (e.metaKey||e.ctrlKey)) run(); });
+$('#show-pipeline').onclick = () => { document.querySelector('#section-how').scrollIntoView({behavior:'smooth', block:'start'}); activateSectionTab('how'); };
+$('#show-corpus').onclick = () => { document.querySelector('#section-corpus').scrollIntoView({behavior:'smooth', block:'start'}); activateSectionTab('corpus'); };
+$('#show-architecture').onclick = () => { document.querySelector('#architecture-section').scrollIntoView({behavior:'smooth', block:'start'}); $('#pane-architecture').classList.add('active'); document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); document.querySelector('.tab:nth-child(6)').classList.add('active'); renderArchitecture(); };
+$('#focus-results').onclick = () => { document.querySelector('#results').scrollIntoView({behavior:'smooth', block:'start'}); };
+const architectureLink = document.querySelector('a[href="#architecture-section"]');
+if (architectureLink) {
+  architectureLink.addEventListener('click', e => {
+    e.preventDefault();
+    document.querySelector('#architecture-section').scrollIntoView({behavior:'smooth', block:'start'});
+    document.querySelector('#results').scrollIntoView({behavior:'smooth', block:'start'});
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    const archTab = Array.from(document.querySelectorAll('.tab'))[5];
+    if (archTab) archTab.classList.add('active');
+    renderArchitecture();
+  });
+}
+
+document.querySelectorAll('#section-tabs .tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    const name = tab.dataset.tab;
+    activateSectionTab(name);
+  });
+});
+
+function activateSectionTab(name) {
+  document.querySelectorAll('#section-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.tab === name));
+  document.querySelectorAll('#section-how, #section-corpus').forEach(x => x.classList.remove('active'));
+  const pane = document.querySelector('#section-' + name);
+  if (pane) pane.classList.add('active');
+}
 </script>
 </body>
 </html>
 """
 
+INDEX_HTML = INDEX_HTML.replace("{RUNTIME_STATUS}", RUNTIME_STATUS).replace("{FOOTER_LABEL}", FOOTER_LABEL)
 
 def main():
     ap = argparse.ArgumentParser()

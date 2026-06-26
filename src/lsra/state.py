@@ -82,6 +82,7 @@ class LSRAState:
     route: str = ""                    # AUTO_PASS | ASYNC_BATCH | SYNC_REVIEW
     escalations: List[str] = field(default_factory=list)
     trace: List[str] = field(default_factory=list)   # audit log
+    langgraph_loops: int = 0
 
     def log(self, msg: str) -> None:
         self.trace.append(msg)

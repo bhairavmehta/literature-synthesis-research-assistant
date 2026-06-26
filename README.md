@@ -8,19 +8,40 @@ The single failure mode the whole design targets is **confident hallucinated syn
 
 **It runs end-to-end with no API keys.** Offline mode uses a deterministic stub LLM + a hashed-n-gram embedder over a local corpus, so a reviewer can clone and run in seconds. Set `LSRA_PROVIDER=openai|anthropic` (and `LSRA_ONLINE_RETRIEVAL=1`) to swap in real models and live arXiv retrieval behind the *same* agent code.
 
+Live deployed site: https://lsra-1477.azurewebsites.net
+
 ---
 
 ## Quickstart
 
 ```bash
-git clone <your-fork-url> && cd literature-synthesis-research-assistant
-pip install -r requirements.txt --break-system-packages    # only pyyaml + pytest
+git clone <your-fork-url> && cd literature-synthesis-research-assistant-main
+python3 -m pip install -r requirements.txt --break-system-packages
 python examples/demo.py --trace                            # full brief + audit log
 python -m pytest -q                                        # 10 tests
 python eval/harness.py                                     # 5-Metric Rule table
 ```
 
 No virtualenv, no keys, no network required for the offline demo. (`make demo`, `make test`, `make eval` wrap these.)
+
+### Running the web UI locally
+
+```bash
+python app.py
+```
+
+Then open `http://127.0.0.1:8000` in your browser.
+
+### Running the web UI with online models
+
+```bash
+export LSRA_PROVIDER=anthropic            # or openai
+export ANTHROPIC_API_KEY=sk-ant-...
+export LSRA_ONLINE_RETRIEVAL=1
+python app.py
+```
+
+Open the same local URL after the server starts. The same UI and pipeline code are used for both offline and online execution.
 
 ---
 
